@@ -1,0 +1,205 @@
+# 1. 导入libraries，将所有患者的目录列出来：
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+import dicom
+import os
+import scipy.ndimage
+import matplotlib.pyplot as plt
+
+from skimage import measure, morphology
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+# 包含所有患者目录的根目录
+INPUT_FOLDER = '../input/sample_images/'
+patients = os.listdir(INPUT_FOLDER)
+patients.sort()
+# 2.扫描一个患者的目录，加载所有的切片，按切换的z方向排序切片，并获取切片厚度
+def load_scan(path):
+    slices = [dicom.read_file(path + '/' + s) for s in os.listdir(path)]
+    slices.sort(key = lambda x: float(x.ImagePositionPatient[2]))
+    try:
+        slice_thickness = np.abs(slices[0].ImagePositionPatient[2] - slices[1].ImagePositionPatient[2])
+    except:
+        slice_thickness = np.abs(slices[0].SliceLocation - slices[1].SliceLocation)
+
+    for s in slices:
+        s.SliceThickness = slice_thickness
+
+    return slices
+ # 3、默认情况下，从DICOM文件中获得的值是HU这个单位。 需要解决这个问题。某些扫描仪具有圆柱扫描边界，
+ # 但输出图像为方形。 落在这些边界之外的像素获得固定值-2000。 第一步是将这些值设置为0，当前对应于air。 接下来，回到HU单位，乘以重新缩放斜率并添加截距（方便地存储在扫描的元数据中！）
+ def get_pixels_hu(slices):
+    image = np.stack([s.pixel_array for s in slices])
+    # 转换为int16，int16是ok的，因为所有的数值都应该 <32k
+    image = image.astype(np.int16)
+
+    # 设置边界外的元素为0
+    image[image == -2000] = 0
+
+    # 转换为HU单位
+    for slice_number in range(len(slices)):
+
+        intercept = slices[slice_number].RescaleIntercept
+        slope = slices[slice_number].RescaleSlope
+
+        if slope != 1:
+            image[slice_number] = slope * image[slice_number].astype(np.float64)
+            image[slice_number] = image[slice_number].astype(np.int16)
+
+        image[slice_number] += np.int16(intercept)
+
+    return np.array(image, dtype=np.int16)
+    
+  #  4.查看一个患者的图像：
+first_patient = load_scan(INPUT_FOLDER + patients[0])
+first_patient_pixels = get_pixels_hu(first_patient)
+plt.hist(first_patient_pixels.flatten(), bins=80, color='c')
+plt.xlabel("Hounsfield Units (HU)")
+plt.ylabel("Frequency")
+plt.show()
+
+# 显示一个中间位置的切片
+plt.imshow(first_patient_pixels[80], cmap=plt.cm.gray)
+plt.show()
+
+# 5、重新采样. CT 扫描可能的像素间距为[2.5, 0.5, 0.5]，代表着切片间的距离是2.5毫米。对于不同的扫描，切片距离可能不同，对于自动分析是一个问题。
+
+# 常用的方法是将整个数据集重新采样为相同分辨率的切片。例如将所有切片采样为[1 1 1]毫米的间距。这样就可以使用3D网格，而无需担心切片厚度的不确定性。
+def resample(image, scan, new_spacing=[1,1,1]):
+    # Determine current pixel spacing
+    spacing = np.array([scan[0].SliceThickness] + scan[0].PixelSpacing, dtype=np.float32)
+
+    resize_factor = spacing / new_spacing
+    new_real_shape = image.shape * resize_factor
+    new_shape = np.round(new_real_shape)
+    real_resize_factor = new_shape / image.shape
+    new_spacing = spacing / real_resize_factor
+
+    image = scipy.ndimage.interpolation.zoom(image, real_resize_factor, mode='nearest')
+
+    return image, new_spacing
+
+pix_resampled, spacing = resample(first_patient_pixels, first_patient, [1,1,1])
+print("Shape before resampling\t", first_patient_pixels.shape)
+print("Shape after resampling\t", pix_resampled.shape)
+
+# 6、画3D图像
+# 显示扫描3D图像，对数据有个直观的感受对处理数据是有用的。不幸的是，将使用立方体为我们的3D对象创建一个近似网格，并使用matplotlib绘制它。
+def plot_3d(image, threshold=-300):
+
+    # Position the scan upright, 
+    # so the head of the patient would be at the top facing the camera
+    p = image.transpose(2,1,0)
+
+    verts, faces = measure.marching_cubes(p, threshold)
+
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Fancy indexing: `verts[faces]` to generate a collection of triangles
+    mesh = Poly3DCollection(verts[faces], alpha=0.70)
+    face_color = [0.45, 0.45, 0.75]
+    mesh.set_facecolor(face_color)
+    ax.add_collection3d(mesh)
+
+    ax.set_xlim(0, p.shape[0])
+    ax.set_ylim(0, p.shape[1])
+    ax.set_zlim(0, p.shape[2])
+
+    plt.show()
+
+#7、肺部切割
+# 为了降低问题的复杂度，我们先对肺部进行切割。
+
+# 它涉及很多巧妙的步骤。由区域生长和形态学的一系列操作组成。在这种情况下，我们将仅使用连通分量分析。
+
+# 阈值图像（-320 HU是一个很好的阈值，但这种方法并不重要）
+# 做连接组件，确定人周围的空气标签，在二进制图像中用1s填充
+# 可选：对于扫描中的每个轴向切片，确定最大的固体连接组件（人体周围的身体+空气），并将其他组件设置为0。这样可以填充面罩中肺部的结构。
+# 只保留最大的气袋（人体在这里和那里都有其他的气袋）。
+def largest_label_volume(im, bg=-1):
+    vals, counts = np.unique(im, return_counts=True)
+
+    counts = counts[vals != bg]
+    vals = vals[vals != bg]
+
+    if len(counts) > 0:
+        return vals[np.argmax(counts)]
+    else:
+        return None
+
+def segment_lung_mask(image, fill_lung_structures=True):
+
+    # not actually binary, but 1 and 2. 
+    # 0 is treated as background, which we do not want
+    binary_image = np.array(image > -320, dtype=np.int8)+1
+    labels = measure.label(binary_image)
+
+    # Pick the pixel in the very corner to determine which label is air.
+    #   Improvement: Pick multiple background labels from around the patient
+    #   More resistant to "trays" on which the patient lays cutting the air 
+    #   around the person in half
+    background_label = labels[0,0,0]
+
+    #Fill the air around the person
+    binary_image[background_label == labels] = 2
+
+
+    # Method of filling the lung structures (that is superior to something like 
+    # morphological closing)
+    if fill_lung_structures:
+        # For every slice we determine the largest solid structure
+        for i, axial_slice in enumerate(binary_image):
+            axial_slice = axial_slice - 1
+            labeling = measure.label(axial_slice)
+            l_max = largest_label_volume(labeling, bg=0)
+
+            if l_max is not None: #This slice contains some lung
+                binary_image[i][labeling != l_max] = 1
+
+
+    binary_image -= 1 #Make the image actual binary
+    binary_image = 1-binary_image # Invert it, lungs are now 1
+
+    # Remove other air pockets insided body
+    labels = measure.label(binary_image, background=0)
+    l_max = largest_label_volume(labels, bg=0)
+    if l_max is not None: # There are air pockets
+        binary_image[labels != l_max] = 0
+
+    return binary_image
+
+segmented_lungs = segment_lung_mask(pix_resampled, False)
+segmented_lungs_fill = segment_lung_mask(pix_resampled, True)
+
+plot_3d(segmented_lungs, 0)
+
+plot_3d(segmented_lungs_fill, 0)
+
+
+#### 数据归一化
+# 目前所有的数值在-1024到2000左右。超过400的任何东西其实是不用关心的，因为只是一些具有不同辐射密度的骨骼。 常用的阈值集合在-1000到400之间。这里有一些代码可以使用：
+MIN_BOUND = -1000.0
+MAX_BOUND = 400.0
+
+def normalize(image):
+    image = (image - MIN_BOUND) / (MAX_BOUND - MIN_BOUND)
+    image[image>1] = 1.
+    image[image<0] = 0.
+    return image
+#8、数据零居中
+
+#作为最后的预处理步骤，建议将数据平均值设置为零。为此，只需从所有像素中减去平均像素值。
+
+#要确定这个含义，只需对整个数据集中的所有图像进行平均。
+#
+#警告：不要将每个图像的中心置零（如此处的某些内核中所做的那样）。 校准CT扫描仪以返回准确的HU测量值。 没有像普通图像那样具有较低对比度或亮度的图像。
+
+PIXEL_MEAN = 0.25 # 假设均值为0.25
+
+def zero_center(image):
+    image = image - PIXEL_MEAN
+    return image
+
+
+    
